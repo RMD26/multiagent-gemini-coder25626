@@ -1017,6 +1017,59 @@ public class UserServiceTests
     }
 }
 
+tests/MyApp.IntegrationTests/AuthSettingsRoundtripTests.cs:
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Xunit;
+using MyApp.Api.DTOs;
+
+public class AuthSettingsRoundtripTests : IClassFixture<WebApplicationFactory<Program>>
+{
+    private readonly WebApplicationFactory<Program> _factory;
+
+    public AuthSettingsRoundtripTests(WebApplicationFactory<Program> factory)
+    {
+        _factory = factory;
+    }
+
+    [Fact]
+    public async Task SignUp_SignIn_UpdateSettings_GetSettings()
+    {
+        var client = _factory.CreateClient();
+
+        // 1) Sign up
+        var signUpReq = new { Email = "itest@example.com", Password = "P@ssw0rd1", DisplayName = "ITest" };
+        var signUpResp = await client.PostAsJsonAsync("/api/auth/signup", signUpReq);
+        signUpResp.EnsureSuccessStatusCode();
+
+        // 2) Sign in
+        var signInReq = new { Email = "itest@example.com", Password = "P@ssw0rd1" };
+        var signInResp = await client.PostAsJsonAsync("/api/auth/signin", signInReq);
+        signInResp.EnsureSuccessStatusCode();
+        var tokens = await signInResp.Content.ReadFromJsonAsync<TokenResponse>() ?? throw new Xunit.Sdk.XunitException("No tokens");
+
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", tokens.AccessToken);
+
+        // 3) Update settings
+        var update = new UpdateSettingsRequest(true, false, "dark");
+        var putResp = await client.PutAsJsonAsync("/api/settings", update);
+        putResp.EnsureSuccessStatusCode();
+
+        // 4) Get settings
+        var getResp = await client.GetAsync("/api/settings");
+        getResp.EnsureSuccessStatusCode();
+        var settings = await getResp.Content.ReadFromJsonAsync<SettingsDto>();
+        Assert.NotNull(settings);
+        Assert.True(settings.EmailNotifications);
+        Assert.Equal("dark", settings.Theme);
+    }
+
+    private record TokenResponse(string AccessToken, string RefreshToken);
+}
+
 README snippet: how to run locally (short):
 1. Configure environment
    - Copy .env.example to .env and set DB connection string and JWT secrets (do not commit secrets).
@@ -1071,6 +1124,69 @@ services:
 
 volumes:
   sqlserver-data:
+
+GitHub Actions CI workflow:
+.github/workflows/ci.yml:
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          SA_PASSWORD: "Your_password123!"
+          ACCEPT_EULA: "Y"
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P $SA_PASSWORD -Q 'SELECT 1'"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Wait for SQL Server
+        run: |
+          for i in {1..30}; do
+            /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "Your_password123!" -Q "SELECT 1" && break
+            echo "Waiting for sqlserver..."
+            sleep 2
+          done
+
+      - name: Apply EF Migrations
+        working-directory: src/MyApp.Api
+        env:
+          ConnectionStrings__DefaultConnection: "Server=localhost,1433;Database=MyAppDb;User Id=sa;Password=Your_password123!"
+        run: |
+          dotnet tool restore
+          dotnet ef database update --project ../MyApp.Infrastructure --startup-project ./MyApp.Api
+
+      - name: Build
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Run unit tests
+        run: dotnet test tests/MyApp.UnitTests --no-build --verbosity normal
+
+      - name: Run integration tests
+        env:
+          ConnectionStrings__DefaultConnection: "Server=localhost,1433;Database=MyAppDb;User Id=sa;Password=Your_password123!"
+        run: dotnet test tests/MyApp.IntegrationTests --no-build --verbosity normal
 
 Reviewer pass checklist (security & validation):
 High‑priority checks (must pass before merge):
