@@ -1021,11 +1021,26 @@ namespace MyApp.Infrastructure.Migrations
     }
 }
 
-EF CLI commands:
-# from solution root
+EF CLI Commands:
+Run these from the solution root or src/MyApp.Api as appropriate.
+Add the migration (example assumes MyApp.Infrastructure project contains migrations):
 cd src/MyApp.Api
-dotnet ef migrations add AddUserSettings --project ../MyApp.Infrastructure --startup-project ./MyApp.Api
+dotnet ef migrations add AddRefreshTokensWithTokenHash --project ../MyApp.Infrastructure --startup-project ./MyApp.Api
+
+Apply the migration to the database:
 dotnet ef database update --project ../MyApp.Infrastructure --startup-project ./MyApp.Api
+
+If using the migration that converts an existing table, run:
+dotnet ef migrations add MigrateTokenToTokenHash --project ../MyApp.Infrastructure --startup-project ./MyApp.Api
+dotnet ef database update --project ../MyApp.Infrastructure --startup-project ./MyApp.Api
+
+Post‑Migration Steps and Checklist:
+- Add DbSet to AppDbContext if not present: public DbSet<RefreshToken> RefreshTokens { get; set; } = null!;
+- Rebuild and run tests. Update unit/integration tests to expect raw refresh tokens returned by the service while repository lookups use hashed values (the code already hashes on lookup).
+- Reissue tokens: If you migrated from raw tokens, require users to sign in again so new refresh tokens are created and stored hashed.
+- Back up DB before running migrations in production.
+- Secrets and config: Ensure JWT secret and other sensitive settings are in environment/secret store before running migrations in CI or production.
+- CI integration: Add migration step to your CI workflow before running integration tests (already included in the CI example earlier).
 
 Existing Testing Context (C#):
 tests/MyApp.UnitTests/UserSettingsServiceTests.cs:
