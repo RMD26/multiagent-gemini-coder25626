@@ -13,14 +13,14 @@ const QUICK_PROMPTS = [
     prompt: "Generate a complete Visual Studio solution with backend services, frontend client, and shared libraries. Include build scripts, CI config, and minimal dependencies. Outline the plan, then produce the solution tree and key files."
   },
   {
-    icon: LayoutTemplate,
-    title: "Web App Structure",
-    prompt: "Generate a complete web application structure with REST/GraphQL API, frontend UI, authentication (sign up, sign in), user profile, settings persistence, and deployment manifests."
+    icon: ShieldCheck,
+    title: "Security Hardening",
+    prompt: "Review the authentication flow. Implement refresh token hashing, add rate limiting to auth endpoints, and enforce strict password policies."
   },
   {
-    icon: Smartphone,
-    title: "Android App",
-    prompt: "Generate an Android project with UI layers, data layer, authentication flows (sign up, sign in), profile and settings screens, and sample backend integration."
+    icon: PlayCircle,
+    title: "CI/CD Pipeline",
+    prompt: "Create a GitHub Actions workflow to restore, build, run EF migrations against a local SQL Server container, and execute unit/integration tests."
   }
 ];
 
