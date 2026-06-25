@@ -56,6 +56,26 @@ namespace MyApp.Core.Models
     }
 }
 
+src/MyApp.Core/Models/RefreshToken.cs:
+using System;
+
+namespace MyApp.Core.Models
+{
+    public class RefreshToken
+    {
+        public Guid Id { get; set; }
+        public string Token { get; set; } = null!;
+        public string UserId { get; set; } = null!;
+        public DateTime ExpiresAt { get; set; }
+        public DateTime CreatedAt { get; set; }
+        public string CreatedByIp { get; set; } = null!;
+        public DateTime? RevokedAt { get; set; }
+        public string? RevokedByIp { get; set; }
+        public string? ReplacedByToken { get; set; }
+        public bool IsActive => RevokedAt == null && DateTime.UtcNow < ExpiresAt;
+    }
+}
+
 src/MyApp.Infrastructure/Data/AppDbContext.cs:
 using Microsoft.EntityFrameworkCore;
 using MyApp.Core.Models;
@@ -67,6 +87,7 @@ namespace MyApp.Infrastructure.Data
         public AppDbContext(DbContextOptions<AppDbContext> opts) : base(opts) { }
 
         public DbSet<UserSettings> UserSettings { get; set; } = null!;
+        public DbSet<RefreshToken> RefreshTokens { get; set; } = null!;
 
         protected override void OnModelCreating(ModelBuilder builder)
         {
@@ -104,6 +125,47 @@ namespace MyApp.Core.Interfaces
     {
         Task<UserSettings?> GetByUserIdAsync(string userId, CancellationToken ct = default);
         Task<UserSettings> UpsertAsync(UserSettings entity, CancellationToken ct = default);
+    }
+}
+
+src/MyApp.Core/Interfaces/IUserService.cs:
+namespace MyApp.Core.Interfaces
+{
+    using MyApp.Api.DTOs;
+    public interface IUserService
+    {
+        Task<ProfileDto?> GetProfileAsync(string userId, CancellationToken ct = default);
+        Task<ProfileDto> UpdateProfileAsync(string userId, UpdateProfileRequest req, CancellationToken ct = default);
+        Task<bool> CreateUserAsync(string email, string password, string displayName, CancellationToken ct = default);
+        Task<bool> UserExistsAsync(string email, CancellationToken ct = default);
+    }
+}
+
+src/MyApp.Core/Interfaces/IAuthService.cs:
+using MyApp.Api.DTOs;
+
+namespace MyApp.Core.Interfaces
+{
+    public interface IAuthService
+    {
+        Task<(string accessToken, string refreshToken)> SignInAsync(string email, string password, string ipAddress, CancellationToken ct = default);
+        Task<(string accessToken, string refreshToken)> SignUpAsync(string email, string password, string displayName, string ipAddress, CancellationToken ct = default);
+        Task<(string accessToken, string refreshToken)> RefreshTokenAsync(string token, string ipAddress, CancellationToken ct = default);
+        Task RevokeRefreshTokenAsync(string token, string ipAddress, CancellationToken ct = default);
+    }
+}
+
+src/MyApp.Core/Interfaces/IRefreshTokenRepository.cs:
+using MyApp.Core.Models;
+
+namespace MyApp.Core.Interfaces
+{
+    public interface IRefreshTokenRepository
+    {
+        Task<RefreshToken?> GetByTokenAsync(string token, CancellationToken ct = default);
+        Task AddAsync(RefreshToken token, CancellationToken ct = default);
+        Task UpdateAsync(RefreshToken token, CancellationToken ct = default);
+        Task RevokeAllForUserAsync(string userId, CancellationToken ct = default);
     }
 }
 
@@ -150,6 +212,50 @@ namespace MyApp.Infrastructure.Repositories
     }
 }
 
+src/MyApp.Infrastructure/Repositories/RefreshTokenRepository.cs:
+using Microsoft.EntityFrameworkCore;
+using MyApp.Core.Interfaces;
+using MyApp.Core.Models;
+using MyApp.Infrastructure.Data;
+
+namespace MyApp.Infrastructure.Repositories
+{
+    public class RefreshTokenRepository : IRefreshTokenRepository
+    {
+        private readonly AppDbContext _db;
+        public RefreshTokenRepository(AppDbContext db) => _db = db;
+
+        public async Task<RefreshToken?> GetByTokenAsync(string token, CancellationToken ct = default)
+        {
+            return await _db.Set<RefreshToken>().AsNoTracking().SingleOrDefaultAsync(t => t.Token == token, ct);
+        }
+
+        public async Task AddAsync(RefreshToken token, CancellationToken ct = default)
+        {
+            token.Id = Guid.NewGuid();
+            _db.Set<RefreshToken>().Add(token);
+            await _db.SaveChangesAsync(ct);
+        }
+
+        public async Task UpdateAsync(RefreshToken token, CancellationToken ct = default)
+        {
+            _db.Set<RefreshToken>().Update(token);
+            await _db.SaveChangesAsync(ct);
+        }
+
+        public async Task RevokeAllForUserAsync(string userId, CancellationToken ct = default)
+        {
+            var tokens = await _db.Set<RefreshToken>().Where(t => t.UserId == userId && t.RevokedAt == null).ToListAsync(ct);
+            foreach (var t in tokens)
+            {
+                t.RevokedAt = DateTime.UtcNow;
+            }
+            _db.Set<RefreshToken>().UpdateRange(tokens);
+            await _db.SaveChangesAsync(ct);
+        }
+    }
+}
+
 src/MyApp.Core/Services/UserSettingsService.cs:
 using MyApp.Core.Interfaces;
 using MyApp.Core.Models;
@@ -189,6 +295,205 @@ namespace MyApp.Core.Services
 
             var saved = await _repo.UpsertAsync(entity, ct);
             return new SettingsDto(saved.EmailNotifications, saved.PushNotifications, saved.Theme);
+        }
+    }
+}
+
+src/MyApp.Core/Services/UserService.cs:
+using Microsoft.AspNetCore.Identity;
+using MyApp.Core.Interfaces;
+using MyApp.Api.DTOs;
+
+namespace MyApp.Core.Services
+{
+    public class UserService : IUserService
+    {
+        private readonly IUserRepository _userRepo; // assume exists
+        private readonly IPasswordHasher<UserEntity> _passwordHasher;
+
+        public UserService(IUserRepository userRepo, IPasswordHasher<UserEntity> passwordHasher)
+        {
+            _userRepo = userRepo;
+            _passwordHasher = passwordHasher;
+        }
+
+        public async Task<bool> CreateUserAsync(string email, string password, string displayName, CancellationToken ct = default)
+        {
+            if (await _userRepo.GetByEmailAsync(email, ct) != null) return false;
+
+            var user = new UserEntity
+            {
+                Id = Guid.NewGuid().ToString(),
+                Email = email,
+                DisplayName = displayName,
+                CreatedAt = DateTime.UtcNow
+            };
+            user.PasswordHash = _passwordHasher.HashPassword(user, password);
+            await _userRepo.AddAsync(user, ct);
+            return true;
+        }
+
+        public async Task<bool> UserExistsAsync(string email, CancellationToken ct = default)
+        {
+            return await _userRepo.GetByEmailAsync(email, ct) != null;
+        }
+
+        public async Task<ProfileDto?> GetProfileAsync(string userId, CancellationToken ct = default)
+        {
+            var u = await _userRepo.GetByIdAsync(userId, ct);
+            if (u == null) return null;
+            return new ProfileDto(u.Id, u.Email, u.DisplayName ?? "");
+        }
+
+        public async Task<ProfileDto> UpdateProfileAsync(string userId, UpdateProfileRequest req, CancellationToken ct = default)
+        {
+            var u = await _userRepo.GetByIdAsync(userId, ct) ?? throw new InvalidOperationException("User not found");
+            u.DisplayName = req.DisplayName;
+            u.UpdatedAt = DateTime.UtcNow;
+            await _userRepo.UpdateAsync(u, ct);
+            return new ProfileDto(u.Id, u.Email, u.DisplayName ?? "");
+        }
+    }
+}
+
+src/MyApp.Core/Services/AuthService.cs:
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Security.Cryptography;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.Tokens;
+using MyApp.Core.Interfaces;
+using MyApp.Core.Models;
+using MyApp.Api.DTOs;
+
+namespace MyApp.Core.Services
+{
+    public class JwtSettings
+    {
+        public string Issuer { get; set; } = "";
+        public string Audience { get; set; } = "";
+        public string Secret { get; set; } = ""; // store in env/secret store
+        public int AccessTokenMinutes { get; set; } = 15;
+        public int RefreshTokenDays { get; set; } = 30;
+    }
+
+    public class AuthService : IAuthService
+    {
+        private readonly IUserService _userService;
+        private readonly IUserRepository _userRepo;
+        private readonly IRefreshTokenRepository _refreshRepo;
+        private readonly IPasswordHasher<UserEntity> _passwordHasher;
+        private readonly JwtSettings _jwt;
+
+        public AuthService(
+            IUserService userService,
+            IUserRepository userRepo,
+            IRefreshTokenRepository refreshRepo,
+            IPasswordHasher<UserEntity> passwordHasher,
+            IOptions<JwtSettings> jwtOptions)
+        {
+            _userService = userService;
+            _userRepo = userRepo;
+            _refreshRepo = refreshRepo;
+            _passwordHasher = passwordHasher;
+            _jwt = jwtOptions.Value;
+        }
+
+        public async Task<(string accessToken, string refreshToken)> SignUpAsync(string email, string password, string displayName, string ipAddress, CancellationToken ct = default)
+        {
+            var created = await _userService.CreateUserAsync(email, password, displayName, ct);
+            if (!created) throw new InvalidOperationException("User already exists");
+            var user = await _userRepo.GetByEmailAsync(email, ct) ?? throw new InvalidOperationException("User not found after create");
+            return await GenerateTokensForUserAsync(user, ipAddress, ct);
+        }
+
+        public async Task<(string accessToken, string refreshToken)> SignInAsync(string email, string password, string ipAddress, CancellationToken ct = default)
+        {
+            var user = await _userRepo.GetByEmailAsync(email, ct) ?? throw new UnauthorizedAccessException("Invalid credentials");
+            var verify = _passwordHasher.VerifyHashedPassword(user, user.PasswordHash, password);
+            if (verify == PasswordVerificationResult.Failed) throw new UnauthorizedAccessException("Invalid credentials");
+            return await GenerateTokensForUserAsync(user, ipAddress, ct);
+        }
+
+        public async Task<(string accessToken, string refreshToken)> RefreshTokenAsync(string token, string ipAddress, CancellationToken ct = default)
+        {
+            var existing = await _refreshRepo.GetByTokenAsync(token, ct) ?? throw new SecurityTokenException("Invalid refresh token");
+            if (!existing.IsActive) throw new SecurityTokenException("Refresh token not active");
+
+            var user = await _userRepo.GetByIdAsync(existing.UserId, ct) ?? throw new SecurityTokenException("User not found");
+
+            // rotate token
+            var newRefresh = CreateRefreshToken(ipAddress, user.Id);
+            existing.RevokedAt = DateTime.UtcNow;
+            existing.RevokedByIp = ipAddress;
+            existing.ReplacedByToken = newRefresh.Token;
+
+            await _refreshRepo.UpdateAsync(existing, ct);
+            await _refreshRepo.AddAsync(newRefresh, ct);
+
+            var access = GenerateAccessToken(user);
+            return (access, newRefresh.Token);
+        }
+
+        public async Task RevokeRefreshTokenAsync(string token, string ipAddress, CancellationToken ct = default)
+        {
+            var existing = await _refreshRepo.GetByTokenAsync(token, ct) ?? throw new SecurityTokenException("Invalid token");
+            if (!existing.IsActive) return;
+            existing.RevokedAt = DateTime.UtcNow;
+            existing.RevokedByIp = ipAddress;
+            await _refreshRepo.UpdateAsync(existing, ct);
+        }
+
+        // helpers
+        private async Task<(string accessToken, string refreshToken)> GenerateTokensForUserAsync(UserEntity user, string ipAddress, CancellationToken ct)
+        {
+            // revoke old tokens optionally (policy)
+            // await _refreshRepo.RevokeAllForUserAsync(user.Id, ct);
+
+            var refresh = CreateRefreshToken(ipAddress, user.Id);
+            await _refreshRepo.AddAsync(refresh, ct);
+
+            var access = GenerateAccessToken(user);
+            return (access, refresh.Token);
+        }
+
+        private RefreshToken CreateRefreshToken(string ipAddress, string userId)
+        {
+            var randomBytes = RandomNumberGenerator.GetBytes(64);
+            var token = Convert.ToBase64String(randomBytes);
+            return new RefreshToken
+            {
+                Token = token,
+                UserId = userId,
+                CreatedAt = DateTime.UtcNow,
+                CreatedByIp = ipAddress,
+                ExpiresAt = DateTime.UtcNow.AddDays(_jwt.RefreshTokenDays)
+            };
+        }
+
+        private string GenerateAccessToken(UserEntity user)
+        {
+            var key = new SymmetricSecurityKey(System.Text.Encoding.UTF8.GetBytes(_jwt.Secret));
+            var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+            var claims = new[]
+            {
+                new Claim(JwtRegisteredClaimNames.Sub, user.Id),
+                new Claim(JwtRegisteredClaimNames.Email, user.Email),
+                new Claim(ClaimTypes.NameIdentifier, user.Id),
+                new Claim("displayName", user.DisplayName ?? "")
+            };
+
+            var token = new JwtSecurityToken(
+                issuer: _jwt.Issuer,
+                audience: _jwt.Audience,
+                claims: claims,
+                expires: DateTime.UtcNow.AddMinutes(_jwt.AccessTokenMinutes),
+                signingCredentials: creds
+            );
+
+            return new JwtSecurityTokenHandler().WriteToken(token);
         }
     }
 }
@@ -396,8 +701,7 @@ src/MyApp.Client/wwwroot/index.html:
 
 src/MyApp.Client/Pages/Profile.razor:
 @page "/profile"
-@inject ApiClient Api
-@using MyApp.Api.DTOs
+@inject MyApp.Client.Services.ApiClient Api
 
 <h3>Profile</h3>
 
@@ -413,9 +717,11 @@ else
         <div class="mb-3">
             <label class="form-label">Display name</label>
             <InputText class="form-control" @bind-Value="profileModel.DisplayName" />
+            <ValidationMessage For="@(() => profileModel.DisplayName)" />
         </div>
         <button class="btn btn-primary" type="submit">Save</button>
     </EditForm>
+
     @if (!string.IsNullOrEmpty(message))
     {
         <div class="alert alert-success mt-2">@message</div>
@@ -423,9 +729,9 @@ else
 }
 
 @code {
-    private ProfileDto profileModel;
+    private MyApp.Api.DTOs.ProfileDto profileModel = new("", "", "");
     private bool loading = true;
-    private string message;
+    private string? message;
 
     protected override async Task OnInitializedAsync()
     {
@@ -435,7 +741,7 @@ else
 
     private async Task SaveProfile()
     {
-        var req = new UpdateProfileRequest(profileModel.DisplayName);
+        var req = new MyApp.Api.DTOs.UpdateProfileRequest(profileModel.DisplayName);
         var updated = await Api.UpdateProfileAsync(req);
         message = "Profile saved";
     }
@@ -443,8 +749,7 @@ else
 
 src/MyApp.Client/Pages/Settings.razor:
 @page "/settings"
-@inject ApiClient Api
-@using MyApp.Api.DTOs
+@inject MyApp.Client.Services.ApiClient Api
 
 <h3>Settings</h3>
 
@@ -460,15 +765,15 @@ else
             </h2>
             <div id="collapsePrefs" class="accordion-collapse collapse show" aria-labelledby="headingPrefs" data-bs-parent="#settingsAccordion">
                 <div class="accordion-body">
-                    <div class="mb-3 form-check">
+                    <div class="form-check mb-2">
                         <InputCheckbox class="form-check-input" @bind-Value="settingsModel.EmailNotifications" />
                         <label class="form-check-label">Email notifications</label>
                     </div>
-                    <div class="mb-3 form-check">
+                    <div class="form-check mb-2">
                         <InputCheckbox class="form-check-input" @bind-Value="settingsModel.PushNotifications" />
                         <label class="form-check-label">Push notifications</label>
                     </div>
-                    <div class="mb-3">
+                    <div class="mb-2">
                         <label class="form-label">Theme</label>
                         <InputSelect class="form-select" @bind-Value="settingsModel.Theme">
                             <option value="light">Light</option>
@@ -487,7 +792,7 @@ else
             </h2>
             <div id="collapsePrivacy" class="accordion-collapse collapse" aria-labelledby="headingPrivacy" data-bs-parent="#settingsAccordion">
                 <div class="accordion-body">
-                    <p>Privacy related toggles or info go here.</p>
+                    <p>Privacy toggles and explanations.</p>
                 </div>
             </div>
         </div>
@@ -503,9 +808,9 @@ else
 }
 
 @code {
-    private SettingsDto settingsModel = new SettingsDto(false, false, "light");
+    private MyApp.Api.DTOs.SettingsDto settingsModel = new(false, false, "light");
     private bool loading = true;
-    private string message;
+    private string? message;
 
     protected override async Task OnInitializedAsync()
     {
@@ -515,14 +820,58 @@ else
 
     private async Task SaveSettings()
     {
-        var req = new UpdateSettingsRequest(settingsModel.EmailNotifications, settingsModel.PushNotifications, settingsModel.Theme);
+        var req = new MyApp.Api.DTOs.UpdateSettingsRequest(settingsModel.EmailNotifications, settingsModel.PushNotifications, settingsModel.Theme);
         var updated = await Api.UpdateSettingsAsync(req);
         message = "Settings saved";
     }
 }
 
-EF Core Migration Commands:
-Run from src/MyApp.Api project folder:
+EF Migration — example migration class:
+src/MyApp.Infrastructure/Migrations/20260624_AddUserSettings.cs:
+using System;
+using Microsoft.EntityFrameworkCore.Migrations;
+
+#nullable disable
+
+namespace MyApp.Infrastructure.Migrations
+{
+    public partial class AddUserSettings : Migration
+    {
+        protected override void Up(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.CreateTable(
+                name: "UserSettings",
+                columns: table => new
+                {
+                    Id = table.Column<Guid>(type: "uniqueidentifier", nullable: false),
+                    UserId = table.Column<string>(type: "nvarchar(450)", nullable: false),
+                    EmailNotifications = table.Column<bool>(type: "bit", nullable: false),
+                    PushNotifications = table.Column<bool>(type: "bit", nullable: false),
+                    Theme = table.Column<string>(type: "nvarchar(32)", maxLength: 32, nullable: false, defaultValue: "light"),
+                    UpdatedAt = table.Column<DateTime>(type: "datetime2", nullable: false, defaultValueSql: "GETUTCDATE()")
+                },
+                constraints: table =>
+                {
+                    table.PrimaryKey("PK_UserSettings", x => x.Id);
+                });
+
+            migrationBuilder.CreateIndex(
+                name: "IX_UserSettings_UserId",
+                table: "UserSettings",
+                column: "UserId",
+                unique: true);
+        }
+
+        protected override void Down(MigrationBuilder migrationBuilder)
+        {
+            migrationBuilder.DropTable(name: "UserSettings");
+        }
+    }
+}
+
+EF CLI commands:
+# from solution root
+cd src/MyApp.Api
 dotnet ef migrations add AddUserSettings --project ../MyApp.Infrastructure --startup-project ./MyApp.Api
 dotnet ef database update --project ../MyApp.Infrastructure --startup-project ./MyApp.Api
 
@@ -558,6 +907,116 @@ public class SettingsControllerTests : IClassFixture<WebApplicationFactory<Progr
     }
 }
 
+tests/MyApp.UnitTests/AuthServiceTests.cs:
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.Extensions.Options;
+using Moq;
+using MyApp.Core.Interfaces;
+using MyApp.Core.Models;
+using MyApp.Core.Services;
+using Xunit;
+
+public class AuthServiceTests
+{
+    private readonly Mock<IUserService> _userService = new();
+    private readonly Mock<IUserRepository> _userRepo = new();
+    private readonly Mock<IRefreshTokenRepository> _refreshRepo = new();
+    private readonly IPasswordHasher<UserEntity> _passwordHasher = new PasswordHasher<UserEntity>();
+    private readonly IOptions<JwtSettings> _jwtOptions;
+
+    public AuthServiceTests()
+    {
+        _jwtOptions = Options.Create(new JwtSettings
+        {
+            Issuer = "test",
+            Audience = "test",
+            Secret = "ThisIsASecretKeyForTestsOnlyDontUseInProd_ChangeMe",
+            AccessTokenMinutes = 5,
+            RefreshTokenDays = 7
+        });
+    }
+
+    [Fact]
+    public async Task SignUp_CreatesUserAndReturnsTokens()
+    {
+        // Arrange
+        var email = "new@test.com";
+        var password = "P@ssw0rd!";
+        var displayName = "New User";
+        var ip = "127.0.0.1";
+
+        _userService.Setup(x => x.CreateUserAsync(email, password, displayName, It.IsAny<CancellationToken>()))
+            .ReturnsAsync(true);
+
+        var userEntity = new UserEntity { Id = "u1", Email = email, DisplayName = displayName, PasswordHash = _passwordHasher.HashPassword(null!, password) };
+        _userRepo.Setup(x => x.GetByEmailAsync(email, It.IsAny<CancellationToken>())).ReturnsAsync(userEntity);
+
+        var svc = new AuthService(_userService.Object, _userRepo.Object, _refreshRepo.Object, _passwordHasher, _jwtOptions);
+
+        // Act
+        var (access, refresh) = await svc.SignUpAsync(email, password, displayName, ip);
+
+        // Assert
+        Assert.False(string.IsNullOrEmpty(access));
+        Assert.False(string.IsNullOrEmpty(refresh));
+    }
+
+    [Fact]
+    public async Task SignIn_InvalidPassword_Throws()
+    {
+        var email = "exists@test.com";
+        var password = "wrong";
+        var ip = "127.0.0.1";
+
+        var userEntity = new UserEntity { Id = "u2", Email = email, DisplayName = "Exists", PasswordHash = _passwordHasher.HashPassword(null!, "correct") };
+        _userRepo.Setup(x => x.GetByEmailAsync(email, It.IsAny<CancellationToken>())).ReturnsAsync(userEntity);
+
+        var svc = new AuthService(_userService.Object, _userRepo.Object, _refreshRepo.Object, _passwordHasher, _jwtOptions);
+
+        await Assert.ThrowsAsync<UnauthorizedAccessException>(() => svc.SignInAsync(email, password, ip));
+    }
+}
+
+tests/MyApp.UnitTests/UserServiceTests.cs:
+using System.Threading.Tasks;
+using Moq;
+using MyApp.Core.Interfaces;
+using MyApp.Core.Services;
+using Xunit;
+using Microsoft.AspNetCore.Identity;
+
+public class UserServiceTests
+{
+    [Fact]
+    public async Task CreateUser_ReturnsFalse_WhenUserExists()
+    {
+        var userRepo = new Mock<IUserRepository>();
+        userRepo.Setup(r => r.GetByEmailAsync("a@b.com", default)).ReturnsAsync(new UserEntity());
+
+        var hasher = new PasswordHasher<UserEntity>();
+        var svc = new UserService(userRepo.Object, hasher);
+
+        var result = await svc.CreateUserAsync("a@b.com", "pwd", "Name");
+        Assert.False(result);
+    }
+
+    [Fact]
+    public async Task CreateUser_ReturnsTrue_WhenNew()
+    {
+        var userRepo = new Mock<IUserRepository>();
+        userRepo.Setup(r => r.GetByEmailAsync("new@b.com", default)).ReturnsAsync((UserEntity?)null);
+        userRepo.Setup(r => r.AddAsync(It.IsAny<UserEntity>(), default)).Returns(Task.CompletedTask);
+
+        var hasher = new PasswordHasher<UserEntity>();
+        var svc = new UserService(userRepo.Object, hasher);
+
+        var result = await svc.CreateUserAsync("new@b.com", "pwd", "Name");
+        Assert.True(result);
+    }
+}
+
 README snippet: how to run locally (short):
 1. Configure environment
    - Copy .env.example to .env and set DB connection string and JWT secrets (do not commit secrets).
@@ -576,6 +1035,78 @@ README snippet: how to run locally (short):
 5. Run tests
    dotnet test tests/MyApp.UnitTests
    dotnet test tests/MyApp.IntegrationTests
+
+Docker Compose snippet for local SQL Server:
+build/docker/docker-compose.yml:
+version: "3.8"
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: myapp_sqlserver
+    environment:
+      SA_PASSWORD: "Your_password123" # use env file in real dev; placeholder here
+      ACCEPT_EULA: "Y"
+    ports:
+      - "1433:1433"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P $SA_PASSWORD -Q \\"SELECT 1\\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+
+  api:
+    build:
+      context: ../../src/MyApp.Api
+      dockerfile: Dockerfile
+    environment:
+      - ConnectionStrings__DefaultConnection=Server=sqlserver,1433;Database=MyAppDb;User=sa;Password=\${SA_PASSWORD}
+      - ASPNETCORE_ENVIRONMENT=Development
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    ports:
+      - "5000:80"
+
+volumes:
+  sqlserver-data:
+
+Reviewer pass checklist (security & validation):
+High‑priority checks (must pass before merge):
+- Authentication & Authorization: JWT validation configured with ValidateIssuerSigningKey, ValidateIssuer, ValidateAudience, and RequireHttpsMetadata=true in production. Access to /api/profile and /api/settings requires [Authorize] and uses ClaimTypes.NameIdentifier for user identity.
+- Password handling: Passwords hashed with a secure algorithm (use PasswordHasher<T> or Argon2 via vetted library). No plaintext storage.
+- Refresh tokens: Refresh tokens stored server-side (rotating tokens recommended) and tied to user/device; revoke on logout.
+- Input validation: DTOs use data annotations where applicable; controllers check ModelState.IsValid. Server-side validation for theme values and other enums; do not trust client values.
+- SQL injection & ORM usage: Use EF Core parameterized queries; avoid raw SQL. If raw SQL used, use parameter binding.
+- Sensitive data: No secrets in source. Use environment variables or secret store for DB connection strings and JWT keys. Do not log tokens, passwords, or PII. Mask or redact logs that may contain user identifiers.
+- Transport security: Enforce HTTPS in production; set HSTS and secure cookie flags if cookies used.
+- CSRF: For cookie-based auth, implement anti-forgery tokens. For JWT in Authorization header, CSRF risk is reduced but still consider secure storage.
+- Rate limiting & brute force protection: Add rate limiting on auth endpoints (e.g., sign-in, sign-up) and account lockout after repeated failures.
+- Error handling: Do not leak stack traces or internal errors to clients. Use centralized error handling middleware and return safe error messages.
+- Data access scoping: Ensure repository queries always filter by UserId for per-user data; never return other users’ settings.
+- Client storage: For Blazor WASM: store tokens in memory or secure storage; avoid localStorage for long-lived tokens. For Blazor Server: use server session or secure cookies.
+- CORS: Configure CORS to allow only trusted origins for the frontend in production.
+- Dependency review: List and justify third‑party packages; ensure they are up‑to‑date and have no known vulnerabilities.
+- Tests: Unit tests for validation logic and auth flows; integration tests for roundtrip sign-up/sign-in and settings save/load.
+
+Medium‑priority checks (recommended):
+- Add Content Security Policy (CSP) headers.
+- Add security headers (X-Content-Type-Options, X-Frame-Options).
+- Implement logging of security events (failed logins, token refreshes).
+- Add monitoring/alerting for suspicious activity.
+
+How to run the reviewer pass locally:
+- Run migrations against local SQL Server (docker-compose).
+- Start API and client in dev mode.
+- Execute unit tests: dotnet test tests/MyApp.UnitTests.
+- Execute integration tests: dotnet test tests/MyApp.IntegrationTests.
+- Manual smoke test:
+  - Sign up a test user.
+  - Sign in and obtain access token.
+  - Call GET /api/profile and GET /api/settings with Authorization header.
+  - Update profile and settings; verify DB rows and that only the authenticated user’s data changed.
+  - Check logs for any sensitive data leakage.
 `;
 
 const responseSchema = {
