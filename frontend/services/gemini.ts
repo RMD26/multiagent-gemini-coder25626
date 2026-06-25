@@ -64,7 +64,7 @@ namespace MyApp.Core.Models
     public class RefreshToken
     {
         public Guid Id { get; set; }
-        public string Token { get; set; } = null!;
+        public string TokenHash { get; set; } = null!;
         public string UserId { get; set; } = null!;
         public DateTime ExpiresAt { get; set; }
         public DateTime CreatedAt { get; set; }
@@ -213,6 +213,7 @@ namespace MyApp.Infrastructure.Repositories
 }
 
 src/MyApp.Infrastructure/Repositories/RefreshTokenRepository.cs:
+using System.Security.Cryptography;
 using Microsoft.EntityFrameworkCore;
 using MyApp.Core.Interfaces;
 using MyApp.Core.Models;
@@ -227,7 +228,8 @@ namespace MyApp.Infrastructure.Repositories
 
         public async Task<RefreshToken?> GetByTokenAsync(string token, CancellationToken ct = default)
         {
-            return await _db.Set<RefreshToken>().AsNoTracking().SingleOrDefaultAsync(t => t.Token == token, ct);
+            var hash = ComputeSha256Hash(token);
+            return await _db.Set<RefreshToken>().AsNoTracking().SingleOrDefaultAsync(t => t.TokenHash == hash, ct);
         }
 
         public async Task AddAsync(RefreshToken token, CancellationToken ct = default)
@@ -252,6 +254,13 @@ namespace MyApp.Infrastructure.Repositories
             }
             _db.Set<RefreshToken>().UpdateRange(tokens);
             await _db.SaveChangesAsync(ct);
+        }
+
+        private static string ComputeSha256Hash(string raw)
+        {
+            using var sha = SHA256.Create();
+            var bytes = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(raw));
+            return Convert.ToBase64String(bytes);
         }
     }
 }
@@ -424,27 +433,24 @@ namespace MyApp.Core.Services
             var hashedToken = HashToken(token);
             var existing = await _refreshRepo.GetByTokenAsync(hashedToken, ct) ?? throw new SecurityTokenException("Invalid refresh token");
             
-            if (!existing.IsActive) 
+            if (!existing.IsActive)
             {
-                if (existing.ReplacedByToken != null)
-                {
-                    // Token reuse detected! Revoke all tokens for this user.
-                    await _refreshRepo.RevokeAllForUserAsync(existing.UserId, ct);
-                    throw new SecurityTokenException("Token reuse detected. All tokens revoked. Please sign in again.");
-                }
-                throw new SecurityTokenException("Refresh token not active");
+                // token was revoked: possible reuse attack
+                // revoke all tokens for this user and require re-login
+                await _refreshRepo.RevokeAllForUserAsync(existing.UserId, ct);
+                throw new SecurityTokenException("Refresh token invalid. All sessions revoked. Please sign in again.");
             }
 
             var user = await _userRepo.GetByIdAsync(existing.UserId, ct) ?? throw new SecurityTokenException("User not found");
 
             // rotate token
-            var (newHashed, newRaw) = CreateRefreshToken(ipAddress, user.Id);
+            var (newEntity, newRaw) = CreateRefreshToken(ipAddress, user.Id);
             existing.RevokedAt = DateTime.UtcNow;
             existing.RevokedByIp = ipAddress;
-            existing.ReplacedByToken = newHashed.Token;
+            existing.ReplacedByToken = newEntity.TokenHash;
 
             await _refreshRepo.UpdateAsync(existing, ct);
-            await _refreshRepo.AddAsync(newHashed, ct);
+            await _refreshRepo.AddAsync(newEntity, ct);
 
             var access = GenerateAccessToken(user);
             return (access, newRaw);
@@ -463,22 +469,22 @@ namespace MyApp.Core.Services
         // helpers
         private async Task<(string accessToken, string refreshToken)> GenerateTokensForUserAsync(UserEntity user, string ipAddress, CancellationToken ct)
         {
-            var (hashedToken, rawToken) = CreateRefreshToken(ipAddress, user.Id);
-            await _refreshRepo.AddAsync(hashedToken, ct);
+            var (entity, rawToken) = CreateRefreshToken(ipAddress, user.Id);
+            await _refreshRepo.AddAsync(entity, ct);
 
             var access = GenerateAccessToken(user);
             return (access, rawToken);
         }
 
-        private (RefreshToken hashed, string raw) CreateRefreshToken(string ipAddress, string userId)
+        private (RefreshToken entity, string rawToken) CreateRefreshToken(string ipAddress, string userId)
         {
             var randomBytes = RandomNumberGenerator.GetBytes(64);
             var rawToken = Convert.ToBase64String(randomBytes);
-            var hashedToken = HashToken(rawToken);
+            var tokenHash = ComputeSha256Hash(rawToken);
             
             var rt = new RefreshToken
             {
-                Token = hashedToken,
+                TokenHash = tokenHash,
                 UserId = userId,
                 CreatedAt = DateTime.UtcNow,
                 CreatedByIp = ipAddress,
@@ -487,10 +493,10 @@ namespace MyApp.Core.Services
             return (rt, rawToken);
         }
 
-        private static string HashToken(string token)
+        private static string ComputeSha256Hash(string raw)
         {
             using var sha256 = SHA256.Create();
-            var bytes = System.Text.Encoding.UTF8.GetBytes(token);
+            var bytes = System.Text.Encoding.UTF8.GetBytes(raw);
             var hash = sha256.ComputeHash(bytes);
             return Convert.ToBase64String(hash);
         }
@@ -533,6 +539,42 @@ namespace MyApp.Api.DTOs
 {
     public record SettingsDto(bool EmailNotifications, bool PushNotifications, string Theme);
     public record UpdateSettingsRequest(bool EmailNotifications, bool PushNotifications, string Theme);
+}
+
+src/MyApp.Api/Controllers/AuthController.cs:
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
+using MyApp.Api.DTOs;
+using MyApp.Core.Interfaces;
+
+namespace MyApp.Api.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public class AuthController : ControllerBase
+    {
+        private readonly IAuthService _authService;
+
+        public AuthController(IAuthService authService) => _authService = authService;
+
+        [EnableRateLimiting("authPolicy")]
+        [HttpPost("signin")]
+        public async Task<IActionResult> SignIn([FromBody] SignInRequest req, CancellationToken ct)
+        {
+            var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+            var (access, refresh) = await _authService.SignInAsync(req.Email, req.Password, ip, ct);
+            return Ok(new { AccessToken = access, RefreshToken = refresh });
+        }
+
+        [EnableRateLimiting("authPolicy")]
+        [HttpPost("signup")]
+        public async Task<IActionResult> SignUp([FromBody] SignUpRequest req, CancellationToken ct)
+        {
+            var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+            var (access, refresh) = await _authService.SignUpAsync(req.Email, req.Password, req.DisplayName, ip, ct);
+            return Ok(new { AccessToken = access, RefreshToken = refresh });
+        }
+    }
 }
 
 src/MyApp.Api/Controllers/ProfileController.cs:
@@ -641,30 +683,38 @@ builder.Services.AddScoped<IUserSettingsRepository, UserSettingsRepository>();
 builder.Services.AddScoped<IUserSettingsService, UserSettingsService>();
 
 // Rate Limiting for Auth endpoints
-builder.Services.AddRateLimiter(options => {
-    options.AddFixedWindowLimiter("Auth", opt => {
-        opt.Window = TimeSpan.FromMinutes(1);
-        opt.PermitLimit = 5;
-    });
+builder.Services.AddRateLimiter(options =>
+{
+    options.AddPolicy("authPolicy", httpContext => RateLimitPartition.GetFixedWindowLimiter(
+        partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "anon",
+        factory: _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 5,
+            Window = TimeSpan.FromMinutes(1),
+            QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+            QueueLimit = 0
+        }));
 });
 
 // Assume IUserService and IAuthService are registered elsewhere
 // Authentication (JWT) - configuration must be present in appsettings and secrets
-var jwtSecret = builder.Configuration["Jwt:Secret"];
-if (string.IsNullOrEmpty(jwtSecret) || jwtSecret.Length < 32)
+var jwtSection = builder.Configuration.GetSection("Jwt");
+var jwtSettings = jwtSection.Get<JwtSettings>();
+if (string.IsNullOrWhiteSpace(jwtSettings?.Secret) || jwtSettings.Secret.Length < 32)
 {
-    throw new InvalidOperationException("JWT Secret is missing or too short (min 32 chars).");
+    throw new InvalidOperationException("JWT secret is not configured or too short. Set a strong secret in environment.");
 }
+builder.Services.Configure<JwtSettings>(jwtSection);
 
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(options =>
     {
-        builder.Configuration.Bind("Jwt", options);
+        jwtSection.Bind(options);
         options.RequireHttpsMetadata = true;
         options.TokenValidationParameters = new TokenValidationParameters
         {
             ValidateIssuerSigningKey = true,
-            IssuerSigningKey = new SymmetricSecurityKey(System.Text.Encoding.UTF8.GetBytes(jwtSecret)),
+            IssuerSigningKey = new SymmetricSecurityKey(System.Text.Encoding.UTF8.GetBytes(jwtSettings.Secret)),
             ValidateIssuer = true,
             ValidateAudience = true,
             ClockSkew = TimeSpan.FromMinutes(2)
@@ -1237,6 +1287,42 @@ jobs:
         env:
           ConnectionStrings__DefaultConnection: "Server=localhost,1433;Database=MyAppDb;User Id=sa;Password=Your_password123!"
         run: dotnet test tests/MyApp.IntegrationTests --no-build --verbosity normal
+
+Reviewer pass checklist (security & validation):
+High‑priority checks (must pass before merge):
+- Authentication & Authorization: JWT validation configured with ValidateIssuerSigningKey, ValidateIssuer, ValidateAudience, and RequireHttpsMetadata=true in production. Access to /api/profile and /api/settings requires [Authorize] and uses ClaimTypes.NameIdentifier for user identity.
+- Password handling: Passwords hashed with a secure algorithm (use PasswordHasher<T> or Argon2 via vetted library). No plaintext storage.
+- Refresh tokens: Refresh tokens stored server-side (rotating tokens recommended) and tied to user/device; revoke on logout.
+- Input validation: DTOs use data annotations where applicable; controllers check ModelState.IsValid. Server-side validation for theme values and other enums; do not trust client values.
+- SQL injection & ORM usage: Use EF Core parameterized queries; avoid raw SQL. If raw SQL used, use parameter binding.
+- Sensitive data: No secrets in source. Use environment variables or secret store for DB connection strings and JWT keys. Do not log tokens, passwords, or PII. Mask or redact logs that may contain user identifiers.
+- Transport security: Enforce HTTPS in production; set HSTS and secure cookie flags if cookies used.
+- CSRF: For cookie-based auth, implement anti-forgery tokens. For JWT in Authorization header, CSRF risk is reduced but still consider secure storage.
+- Rate limiting & brute force protection: Add rate limiting on auth endpoints (e.g., sign-in, sign-up) and account lockout after repeated failures.
+- Error handling: Do not leak stack traces or internal errors to clients. Use centralized error handling middleware and return safe error messages.
+- Data access scoping: Ensure repository queries always filter by UserId for per-user data; never return other users’ settings.
+- Client storage: For Blazor WASM: store tokens in memory or secure storage; avoid localStorage for long-lived tokens. For Blazor Server: use server session or secure cookies.
+- CORS: Configure CORS to allow only trusted origins for the frontend in production.
+- Dependency review: List and justify third‑party packages; ensure they are up‑to‑date and have no known vulnerabilities.
+- Tests: Unit tests for validation logic and auth flows; integration tests for roundtrip sign-up/sign-in and settings save/load.
+
+Medium‑priority checks (recommended):
+- Add Content Security Policy (CSP) headers.
+- Add security headers (X-Content-Type-Options, X-Frame-Options).
+- Implement logging of security events (failed logins, token refreshes).
+- Add monitoring/alerting for suspicious activity.
+
+How to run the reviewer pass locally:
+- Run migrations against local SQL Server (docker-compose).
+- Start API and client in dev mode.
+- Execute unit tests: dotnet test tests/MyApp.UnitTests.
+- Execute integration tests: dotnet test tests/MyApp.IntegrationTests.
+- Manual smoke test:
+  - Sign up a test user.
+  - Sign in and obtain access token.
+  - Call GET /api/profile and GET /api/settings with Authorization header.
+  - Update profile and settings; verify DB rows and that only the authenticated user’s data changed.
+  - Check logs for any sensitive data leakage.
 `;
 
 const responseSchema = {
