@@ -71,7 +71,7 @@ namespace MyApp.Core.Models
         public string CreatedByIp { get; set; } = null!;
         public DateTime? RevokedAt { get; set; }
         public string? RevokedByIp { get; set; }
-        public string? ReplacedByToken { get; set; }
+        public string? ReplacedByTokenHash { get; set; }
         public bool IsActive => RevokedAt == null && DateTime.UtcNow < ExpiresAt;
     }
 }
@@ -99,6 +99,15 @@ namespace MyApp.Infrastructure.Data
                 b.HasIndex(x => x.UserId).IsUnique();
                 b.Property(x => x.Theme).HasMaxLength(32).IsRequired();
                 b.Property(x => x.UpdatedAt).HasDefaultValueSql("GETUTCDATE()");
+            });
+
+            builder.Entity<RefreshToken>(b =>
+            {
+                b.HasKey(x => x.Id);
+                b.HasIndex(x => x.TokenHash).IsUnique(false);
+                b.Property(x => x.TokenHash).IsRequired();
+                b.Property(x => x.CreatedAt).HasDefaultValueSql("GETUTCDATE()");
+                b.Property(x => x.ExpiresAt).IsRequired();
             });
         }
     }
@@ -214,6 +223,7 @@ namespace MyApp.Infrastructure.Repositories
 
 src/MyApp.Infrastructure/Repositories/RefreshTokenRepository.cs:
 using System.Security.Cryptography;
+using System.Text;
 using Microsoft.EntityFrameworkCore;
 using MyApp.Core.Interfaces;
 using MyApp.Core.Models;
@@ -229,37 +239,37 @@ namespace MyApp.Infrastructure.Repositories
         public async Task<RefreshToken?> GetByTokenAsync(string token, CancellationToken ct = default)
         {
             var hash = ComputeSha256Hash(token);
-            return await _db.Set<RefreshToken>().AsNoTracking().SingleOrDefaultAsync(t => t.TokenHash == hash, ct);
+            return await _db.RefreshTokens.AsNoTracking().SingleOrDefaultAsync(t => t.TokenHash == hash, ct);
         }
 
         public async Task AddAsync(RefreshToken token, CancellationToken ct = default)
         {
             token.Id = Guid.NewGuid();
-            _db.Set<RefreshToken>().Add(token);
+            _db.RefreshTokens.Add(token);
             await _db.SaveChangesAsync(ct);
         }
 
         public async Task UpdateAsync(RefreshToken token, CancellationToken ct = default)
         {
-            _db.Set<RefreshToken>().Update(token);
+            _db.RefreshTokens.Update(token);
             await _db.SaveChangesAsync(ct);
         }
 
         public async Task RevokeAllForUserAsync(string userId, CancellationToken ct = default)
         {
-            var tokens = await _db.Set<RefreshToken>().Where(t => t.UserId == userId && t.RevokedAt == null).ToListAsync(ct);
+            var tokens = await _db.RefreshTokens.Where(t => t.UserId == userId && t.RevokedAt == null).ToListAsync(ct);
             foreach (var t in tokens)
             {
                 t.RevokedAt = DateTime.UtcNow;
             }
-            _db.Set<RefreshToken>().UpdateRange(tokens);
+            _db.RefreshTokens.UpdateRange(tokens);
             await _db.SaveChangesAsync(ct);
         }
 
         private static string ComputeSha256Hash(string raw)
         {
             using var sha = SHA256.Create();
-            var bytes = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(raw));
+            var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(raw));
             return Convert.ToBase64String(bytes);
         }
     }
@@ -372,6 +382,7 @@ src/MyApp.Core/Services/AuthService.cs:
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Security.Cryptography;
+using System.Text;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.Extensions.Options;
 using Microsoft.IdentityModel.Tokens;
@@ -447,7 +458,7 @@ namespace MyApp.Core.Services
             var (newEntity, newRaw) = CreateRefreshToken(ipAddress, user.Id);
             existing.RevokedAt = DateTime.UtcNow;
             existing.RevokedByIp = ipAddress;
-            existing.ReplacedByToken = newEntity.TokenHash;
+            existing.ReplacedByTokenHash = newEntity.TokenHash;
 
             await _refreshRepo.UpdateAsync(existing, ct);
             await _refreshRepo.AddAsync(newEntity, ct);
@@ -496,14 +507,13 @@ namespace MyApp.Core.Services
         private static string ComputeSha256Hash(string raw)
         {
             using var sha256 = SHA256.Create();
-            var bytes = System.Text.Encoding.UTF8.GetBytes(raw);
-            var hash = sha256.ComputeHash(bytes);
-            return Convert.ToBase64String(hash);
+            var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(raw));
+            return Convert.ToBase64String(bytes);
         }
 
         private string GenerateAccessToken(UserEntity user)
         {
-            var key = new SymmetricSecurityKey(System.Text.Encoding.UTF8.GetBytes(_jwt.Secret));
+            var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_jwt.Secret));
             var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
 
             var claims = new[]
@@ -553,28 +563,59 @@ namespace MyApp.Api.Controllers
     [Route("api/[controller]")]
     public class AuthController : ControllerBase
     {
-        private readonly IAuthService _authService;
+        private readonly IAuthService _auth;
+        public AuthController(IAuthService auth) => _auth = auth;
 
-        public AuthController(IAuthService authService) => _authService = authService;
-
-        [EnableRateLimiting("authPolicy")]
-        [HttpPost("signin")]
-        public async Task<IActionResult> SignIn([FromBody] SignInRequest req, CancellationToken ct)
-        {
-            var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-            var (access, refresh) = await _authService.SignInAsync(req.Email, req.Password, ip, ct);
-            return Ok(new { AccessToken = access, RefreshToken = refresh });
-        }
-
-        [EnableRateLimiting("authPolicy")]
         [HttpPost("signup")]
+        [EnableRateLimiting("authPolicy")]
         public async Task<IActionResult> SignUp([FromBody] SignUpRequest req, CancellationToken ct)
         {
+            if (!ModelState.IsValid) return BadRequest(ModelState);
             var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-            var (access, refresh) = await _authService.SignUpAsync(req.Email, req.Password, req.DisplayName, ip, ct);
+            var (access, refresh) = await _auth.SignUpAsync(req.Email, req.Password, req.DisplayName, ip, ct);
             return Ok(new { AccessToken = access, RefreshToken = refresh });
         }
+
+        [HttpPost("signin")]
+        [EnableRateLimiting("authPolicy")]
+        public async Task<IActionResult> SignIn([FromBody] SignInRequest req, CancellationToken ct)
+        {
+            if (!ModelState.IsValid) return BadRequest(ModelState);
+            var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+            var (access, refresh) = await _auth.SignInAsync(req.Email, req.Password, ip, ct);
+            return Ok(new { AccessToken = access, RefreshToken = refresh });
+        }
+
+        [HttpPost("refresh")]
+        [EnableRateLimiting("authPolicy")]
+        public async Task<IActionResult> Refresh([FromBody] RefreshRequest req, CancellationToken ct)
+        {
+            var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+            var (access, refresh) = await _auth.RefreshTokenAsync(req.RefreshToken, ip, ct);
+            return Ok(new { AccessToken = access, RefreshToken = refresh });
+        }
+
+        [HttpPost("revoke")]
+        [EnableRateLimiting("authPolicy")]
+        public async Task<IActionResult> Revoke([FromBody] RevokeRequest req, CancellationToken ct)
+        {
+            var ip = HttpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+            await _auth.RevokeRefreshTokenAsync(req.RefreshToken, ip, ct);
+            return NoContent();
+        }
     }
+
+    // DTOs used by controller (simple inline definitions; move to DTO file if preferred)
+    public record SignUpRequest([property: System.ComponentModel.DataAnnotations.Required, System.ComponentModel.DataAnnotations.EmailAddress] string Email,
+                                [property: System.ComponentModel.DataAnnotations.Required, System.ComponentModel.DataAnnotations.MinLength(8)] string Password,
+                                [property: System.ComponentModel.DataAnnotations.Required] string DisplayName);
+
+    public record SignInRequest([property: System.ComponentModel.DataAnnotations.Required, System.ComponentModel.DataAnnotations.EmailAddress] string Email,
+                                [property: System.ComponentModel.DataAnnotations.Required] string Password);
+
+    public record RefreshRequest([property: System.ComponentModel.DataAnnotations.Required] string RefreshToken);
+
+    public record RevokeRequest([property: System.ComponentModel.DataAnnotations.Required] string RefreshToken);
 }
 
 src/MyApp.Api/Controllers/ProfileController.cs:
@@ -662,66 +703,79 @@ namespace MyApp.Api.Controllers
 }
 
 src/MyApp.Api/Program.cs:
+using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
-using System.Threading.RateLimiting;
 using MyApp.Core.Interfaces;
 using MyApp.Core.Services;
 using MyApp.Infrastructure.Data;
 using MyApp.Infrastructure.Repositories;
+using Microsoft.Extensions.Options;
+using System.Threading.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Configuration: connection string and JWT settings come from configuration/environment
+// Configuration
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection") ?? "Server=localhost;Database=MyAppDb;User=sa;Password=Your_password123;";
 builder.Services.AddDbContext<AppDbContext>(options => options.UseSqlServer(connectionString));
 
-// Add repositories and services
-builder.Services.AddScoped<IUserSettingsRepository, UserSettingsRepository>();
-builder.Services.AddScoped<IUserSettingsService, UserSettingsService>();
-
-// Rate Limiting for Auth endpoints
-builder.Services.AddRateLimiter(options =>
-{
-    options.AddPolicy("authPolicy", httpContext => RateLimitPartition.GetFixedWindowLimiter(
-        partitionKey: httpContext.Connection.RemoteIpAddress?.ToString() ?? "anon",
-        factory: _ => new FixedWindowRateLimiterOptions
-        {
-            PermitLimit = 5,
-            Window = TimeSpan.FromMinutes(1),
-            QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
-            QueueLimit = 0
-        }));
-});
-
-// Assume IUserService and IAuthService are registered elsewhere
-// Authentication (JWT) - configuration must be present in appsettings and secrets
+// JWT settings and validation (fail fast if secret missing/weak)
 var jwtSection = builder.Configuration.GetSection("Jwt");
 var jwtSettings = jwtSection.Get<JwtSettings>();
-if (string.IsNullOrWhiteSpace(jwtSettings?.Secret) || jwtSettings.Secret.Length < 32)
+if (jwtSettings == null || string.IsNullOrWhiteSpace(jwtSettings.Secret) || jwtSettings.Secret.Length < 32)
 {
     throw new InvalidOperationException("JWT secret is not configured or too short. Set a strong secret in environment.");
 }
 builder.Services.Configure<JwtSettings>(jwtSection);
 
-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(options =>
+// Authentication
+builder.Services.AddAuthentication(options =>
+{
+    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+})
+.AddJwtBearer(options =>
+{
+    var key = Encoding.UTF8.GetBytes(jwtSettings.Secret);
+    options.TokenValidationParameters = new TokenValidationParameters
     {
-        jwtSection.Bind(options);
-        options.RequireHttpsMetadata = true;
-        options.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateIssuerSigningKey = true,
-            IssuerSigningKey = new SymmetricSecurityKey(System.Text.Encoding.UTF8.GetBytes(jwtSettings.Secret)),
-            ValidateIssuer = true,
-            ValidateAudience = true,
-            ClockSkew = TimeSpan.FromMinutes(2)
-        };
-    });
+        ValidateIssuerSigningKey = true,
+        IssuerSigningKey = new SymmetricSecurityKey(key),
+        ValidateIssuer = true,
+        ValidIssuer = jwtSettings.Issuer,
+        ValidateAudience = true,
+        ValidAudience = jwtSettings.Audience,
+        ValidateLifetime = true,
+        ClockSkew = TimeSpan.FromMinutes(2)
+    };
+    options.RequireHttpsMetadata = true;
+});
 
-builder.Services.AddAuthorization();
+// Rate limiting (example policy for auth endpoints)
+builder.Services.AddRateLimiter(options =>
+{
+    options.AddPolicy("authPolicy", context =>
+    {
+        var ip = context.Connection.RemoteIpAddress?.ToString() ?? "anon";
+        return RateLimitPartition.GetFixedWindowLimiter(ip, _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 5,
+            Window = TimeSpan.FromMinutes(1),
+            QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+            QueueLimit = 0
+        });
+    });
+});
+
+// DI registrations
+builder.Services.AddScoped<IRefreshTokenRepository, RefreshTokenRepository>();
+builder.Services.AddScoped<IAuthService, AuthService>();
+// Ensure IUserService, IUserRepository, IUserSettingsService, IUserSettingsRepository are registered elsewhere
+builder.Services.AddScoped<IUserSettingsRepository, UserSettingsRepository>();
+builder.Services.AddScoped<IUserSettingsService, UserSettingsService>();
+
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
